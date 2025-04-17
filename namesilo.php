@@ -10,6 +10,7 @@ use WHMCS\Domains\DomainLookup\SearchResult;
 
 #Price sync dependencies
 //use WHMCS\Domains\DomainLookup\ResultsList;
+use WHMCS\Domain\Registrar\Domain;
 use WHMCS\Domain\TopLevel\ImportItem;
 
 function namesilo_getConfigArray()
@@ -95,6 +96,14 @@ function namesilo_transactionCall($callType, $call, $params)
                 if ($code == '301' || $code == '302') {
                     $response['error'] .= ' - ' . (string)$xml->reply->message;
                 }
+                break;
+            case "registrantVerificationStatus":
+                if ($code == '300') {
+                    $response['email'] = $xml->reply->email;
+                    break;
+                }
+
+                $response['error'] = $detail;
                 break;
             case 'domainSync':
 
@@ -269,7 +278,9 @@ function namesilo_transactionCall($callType, $call, $params)
         # Prepare Message
         $message = "Transaction Call: " . $call . "\n\n";
         $message .= "XML Response: " . $content . "\n\n";
-        $message .= "Error Message: " . $response['error'] . "\n\n";
+        if (isset($response['error'])) {
+            $message .= "Error Message: " . $response['error'] . "\n\n";
+        }
         $message .= "Response Code: " . $code . "\n\n";
         $message .= "Response Detail: " . $detail . "\n\n";
         $message .= $params["sld"] . "." . $params["tld"];
@@ -297,6 +308,125 @@ function namesilo_transactionCall($callType, $call, $params)
     return $response;
 }
 
+function namesilo_GetDomainInformation(array $params)
+{
+    # Set Appropriate API Server
+    $apiServerUrl = ($params['Test_Mode'] == 'on') ? TEST_API_SERVER : LIVE_API_SERVER;
+    
+    # Set Appropriate API Key
+    $apiKey = ($params['Test_Mode'] == 'on') ? $params['Sandbox_API_Key'] : $params['Live_API_Key'];
+    
+    # Register Variables
+    $tld = urlencode($params["tld"]);
+    $sld = urlencode($params["sld"]);
+
+    # Transaction Call
+    $domain = namesilo_transactionCall("domainSync", $apiServerUrl . "/api/getDomainInfo?version=1&type=xml&key=$apiKey&domain=$sld.$tld", $params);
+
+    $contact_ids = $domain->contact_ids;
+
+    $response = [];
+
+    $nameservers = $domain->nameservers;
+    $i = 0;
+    foreach ($nameservers->nameserver as $ns) {
+        $response['nameservers']['ns' . ++$i] = (string)$ns;
+    }
+
+    $status = (string)$domain->status;
+    $active = in_array($status, ['Active', 'Grace', 'Redemption'], true);
+    $response['status'] = [
+        'active' => $active,
+        'cancelled' => !$active,
+        'transferredAway' => false,
+        'expirydate' => (string)$domain->expires,
+    ];
+
+    $TransferLock = (string)$domain->locked;
+    if ($TransferLock == 'Yes') {
+        $response['transferlock'] = 'locked';
+    } elseif ($TransferLock == 'No') {
+        $response['transferlock'] = 'unlocked';
+    } else {
+        $response['transferlock']['error'] = 'There was a problem';
+    }
+
+
+    $details = namesilo_transactionCall("getContactDetails", "$apiServerUrl/api/contactList?version=1&type=xml&key=$apiKey&contact_id={$contact_ids->registrant}", $params);
+
+    $firstName = (string)$details['firstname'];
+    $lastName = (string)$details['lastname'];
+    $organisation = (string)$details['company'];
+    $email = (string)$details['email'];
+
+    $verificationDetails = namesilo_transactionCall('registrantVerificationStatus', "$apiServerUrl/api/registrantVerificationStatus?version=1&type=xml&key=$apiKey&email=$email", $params);
+    $result = (array)$verificationDetails['email'];
+
+    $is_verified = !empty($result) && strtolower($result['verified']) === 'yes';
+
+    if (!$is_verified) {
+        return (new Domain)
+            ->setIsIrtpEnabled(true)
+            ->setIrtpOptOutStatus(false)
+            ->setRestorable(false)
+            ->setIrtpTransferLock(true)
+            ->setDomainContactChangePending(true)
+            ->setPendingSuspension(true)
+            ->setIrtpVerificationTriggerFields(
+                [
+                    'Registrant' => [
+                        $firstName,
+                        $lastName,
+                        $organisation,
+                        $email,
+                    ],
+                ]
+            );
+    }
+
+    return (new Domain)
+        ->setNameservers($response['nameservers'])
+        ->setRegistrationStatus($response['status'])
+        ->setTransferLock($response['transferlock'])
+        ->setTransferLockExpiryDate(null)
+        ->setIsIrtpEnabled(in_array($tld, ['.com']))
+        ->setIrtpVerificationTriggerFields(
+            [
+                'Registrant' => [
+                    $firstName,
+                    $lastName,
+                    $organisation,
+                    $email,
+                ],
+            ]
+        );
+}
+
+function namesilo_ResendIRTPVerificationEmail($params)
+{
+    # Set Appropriate API Server
+    $apiServerUrl = ($params['Test_Mode'] == 'on') ? TEST_API_SERVER : LIVE_API_SERVER;
+    # Set Appropriate API Key
+    $apiKey = ($params['Test_Mode'] == 'on') ? $params['Sandbox_API_Key'] : $params['Live_API_Key'];
+    $tld = urlencode($params["tld"]);
+    $sld = urlencode($params["sld"]);
+   
+    $contact_ids = namesilo_transactionCall("getContactID", $apiServerUrl . "/api/getDomainInfo?version=1&type=xml&key=$apiKey&domain=$sld.$tld", $params);
+    
+    $role = 'registrant';
+
+    $details = namesilo_transactionCall("getContactDetails", "$apiServerUrl/api/contactList?version=1&type=xml&key=$apiKey&contact_id={$contact_ids[$role]}", $params);
+    
+    $email = (string)$details['email'];
+
+    $result = namesilo_transactionCall("emailVerification", "$apiServerUrl/api/emailVerification?version=1&type=xml&key=$apiKey&email=$email", $params);
+   
+    if ($result["error"]) {
+        return ['error' => $result["error"]];
+    }
+
+    return ['success' => true];
+}
 /*****************************************/
 /* Process .us/.ca params                */
 /*****************************************/
@@ -1381,7 +1511,7 @@ function namesilo_Sync($params)
         }
 
         $status = (string)$result->status;
-        $active = $status === 'Active' ? true : false;
+        $active = in_array($status, ['Active', 'Grace', 'Redemption'], true);
 
         return [
             'active' => $active,
@@ -1428,23 +1558,34 @@ function namesilo_TransferSync($params){
         }
 
         $status = (string)$result->status;
-        if ($status === 'Transfer Completed'){
-            return array(
-                'completed' => true, // Return as true upon successful completion of the transfer
-                'expirydate' => (string)$result->expiration, // The expiry date of the domain    
-            );
+        if ($status === 'Transfer Completed') {
+
+            /** @var SimpleXMLElement $result */
+            $domainInfoResult = namesilo_transactionCall('domainSync', $apiServerUrl . "/api/getDomainInfo?version=1&type=xml&key=$apiKey&domain=$domainName", $params);
+
+            $code = (int)$domainInfoResult->code;
+            if ($code !== 300) {
+                return ['error' => 'ERROR: ' . $domainName . ' - Code:' . $code . ' Domain Info Detail: ' . (string)$domainInfoResult->detail];
+            }
+
+            $status = (string)$domainInfoResult->status;
+            if ($status === 'Active') {
+                return array(
+                    'completed' => true, // Return as true upon successful completion of the transfer
+                    'expirydate' => (string)$result->expiration, // The expiry date of the domain
+                );
+            }
         } else if (in_array($status, $transfer_failed_statuses)){
             return array(
                 'failed' => true,
                 'reason' => $status
             );
-        } else {
-            return array(
-                'completed' => false,
-                'failed' => false
-            );
         }
 
+        return array(
+            'completed' => false,
+            'failed' => false
+        );
     } catch (\Throwable $e) {
         return ['error' => 'ERROR: ' . $domainName . ' - ' . $e->getMessage()];
     }
@@ -1518,6 +1659,7 @@ function namesilo_CheckAvailability ($params) {
                 $sDomain["searchResult"] = $sResult;
             }
         }
+        unset($sDomain);
     } else {
         //logActivity($values["error"]);
         throw new Exception($values["error"]);
@@ -1586,6 +1728,7 @@ function namesilo_GetDomainSuggestions($params) {
                 }
             }
         }
+        unset($sDomain);
     } else {
         //logActivity($values["error"]);
         throw new Exception($values["error"]);
